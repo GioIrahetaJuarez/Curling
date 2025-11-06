@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
+using TMPro; // changed from UnityEngine.UI
 
 public class playerScript : MonoBehaviour
 {
@@ -45,6 +46,27 @@ public class playerScript : MonoBehaviour
     public Color aimEndColor = new Color(1f, 0.8f, 0.2f, 0f);
     // --- end colors ---
 
+    // Contextual UI text (now uses TextMeshPro)
+    [Header("Contextual Text")]
+    public TMP_Text contextText;                     // assign a TMP Text from the scene (Canvas)
+    public Vector2 contextOffset = new Vector2(0f, 50f); // offset in screen pixels from spawnPoint
+
+    // --- Scrub audio (new) ---
+    [Header("Scrub Audio")]
+    public AudioClip scrubClip;                      // clip to play on each scrub press
+    public AudioSource scrubAudioSource;             // optional: assign an AudioSource; otherwise created at runtime
+    [Tooltip("Pitch multiplier applied per unit of distanceAlong when scrubbing")]
+    public float scrubPitchMultiplier = 0.2f;
+    [Range(0f,1f)]
+    public float scrubVolume = 0.9f;
+
+    // Fire audio (play when puck is launched)
+    [Header("Fire Audio")]
+    public AudioClip fireClip;               // clip played when puck is fired
+    public AudioSource fireAudioSource;      // optional: assign to control pitch/3D settings
+    [Range(0f,2.0f)]
+    public float fireVolume = 1f;
+
     InputState state = InputState.Idle;
 
     // internal
@@ -63,6 +85,29 @@ public class playerScript : MonoBehaviour
         currentAimAngle = (aimMinAngle + aimMaxAngle) * 0.5f;
         CreateAimIndicator();
         SetAimIndicatorActive(false);
+
+        // ensure context text initial visibility
+        UpdateContextText();
+
+        // ensure a scrub audio source exists if a clip is assigned
+        if (scrubClip != null && scrubAudioSource == null)
+        {
+            GameObject go = new GameObject("ScrubAudioSource");
+            go.transform.SetParent(transform, false);
+            scrubAudioSource = go.AddComponent<AudioSource>();
+            scrubAudioSource.playOnAwake = false;
+            scrubAudioSource.spatialBlend = 0f; // 2D
+        }
+
+        // if a fireClip is supplied but no AudioSource, create a simple 2D AudioSource attached to player
+        if (fireClip != null && fireAudioSource == null)
+        {
+            GameObject go = new GameObject("FireAudioSource");
+            go.transform.SetParent(transform, false);
+            fireAudioSource = go.AddComponent<AudioSource>();
+            fireAudioSource.playOnAwake = false;
+            fireAudioSource.spatialBlend = 0f; // 2D by default; change if you want 3D
+        }
     }
 
     void Update()
@@ -112,6 +157,9 @@ public class playerScript : MonoBehaviour
                 }
                 break;
         }
+
+        // update contextual UI text and position each frame
+        UpdateContextText();
     }
 
     void EnterAiming()
@@ -192,6 +240,42 @@ public class playerScript : MonoBehaviour
         float force = shootForce + extra;
 
         rb.AddForce(dir.normalized * force, ForceMode2D.Impulse);
+
+        // play firing sound
+        PlayFireSound(pos);
+
+        // register shot and let manager track the puck
+        if (targetManagerScript.Instance != null)
+        {
+            targetManagerScript.Instance.RegisterShot();
+            targetManagerScript.Instance.TrackPuck(puck);
+        }
+        else
+        {
+            var mgr = FindObjectOfType<targetManagerScript>();
+            if (mgr != null)
+            {
+                mgr.RegisterShot();
+                mgr.TrackPuck(puck);
+            }
+        }
+    }
+
+    // new helper to play the fire audio
+    void PlayFireSound(Vector3 worldPos)
+    {
+        if (fireClip == null) return;
+
+        if (fireAudioSource != null)
+        {
+            fireAudioSource.pitch = 1f;
+            fireAudioSource.PlayOneShot(fireClip, fireVolume);
+        }
+        else
+        {
+            // fallback: create a temporary 3D audio source at the puck/world position
+            AudioSource.PlayClipAtPoint(fireClip, worldPos, fireVolume);
+        }
     }
 
     [Header("Scrub Movement")]
@@ -254,6 +338,16 @@ public class playerScript : MonoBehaviour
         float angle = Mathf.Atan2(velocityTowardLine.y, velocityTowardLine.x) * Mathf.Rad2Deg;
         go.transform.rotation = Quaternion.Euler(0f, 0f, angle);
 
+        // play scrub audio with pitch based on distanceAlong
+        if (scrubClip != null && scrubAudioSource != null)
+        {
+            float pitch = 0.5f + (distanceAlong * scrubPitchMultiplier);
+            pitch = Mathf.Clamp(pitch, 0.5f, 3f);
+            scrubAudioSource.pitch = pitch;
+            scrubAudioSource.PlayOneShot(scrubClip, scrubVolume);
+            // do not forcibly reset pitch here — subsequent calls will overwrite as needed
+        }
+
         // short-lived: delete itself after a brief time
         Destroy(go, lifeSeconds);
     }
@@ -295,6 +389,55 @@ public class playerScript : MonoBehaviour
         Vector3 end = origin + (Vector3)dir.normalized * aimLength;
         aimLine.SetPosition(0, origin);
         aimLine.SetPosition(1, end);
+    }
+
+    // new: update contextual UI text based on current state and position it near spawnPoint
+    void UpdateContextText()
+    {
+        if (contextText == null)
+            return;
+
+        string msg = "";
+        switch (state)
+        {
+            case InputState.Idle:
+                msg = "Press space to begin aiming";
+                break;
+            case InputState.Aiming:
+                msg = "Press space to lock in your angle";
+                break;
+            case InputState.Scrubbing:
+                msg = "Repeatedly press space to scrub the ice. More scrubbing results in faster firing speed";
+                break;
+        }
+
+        contextText.text = msg;
+
+        // position the UI text near the spawn point / player with the given offset
+        Camera cam = Camera.main;
+        Vector3 worldPos = (spawnPoint != null) ? spawnPoint.position : transform.position;
+        if (cam != null)
+        {
+            Vector3 screenPos = cam.WorldToScreenPoint(worldPos);
+            // if behind camera, hide text
+            if (screenPos.z <= 0f)
+            {
+                contextText.enabled = false;
+            }
+            else
+            {
+                contextText.enabled = true;
+                // apply offset (x,y) in screen pixels
+                Vector3 finalPos = screenPos + new Vector3(contextOffset.x, contextOffset.y, 0f);
+                // place RectTransform position (works for Screen Space - Overlay canvases and Screen Space - Camera)
+                contextText.rectTransform.position = finalPos;
+            }
+        }
+        else
+        {
+            // fallback: just enable and do not move
+            contextText.enabled = true;
+        }
     }
 
     // Simple side scrub UI using OnGUI
